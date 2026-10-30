@@ -148,6 +148,118 @@ def bnsh_shaders(d, base, label):
             out.append((f'{label}#BNSH@{base:#x}#var{v}', st, ctl, code))
     return out
 
+def nxsd_shaders(d, label):
+    """Nintendo NXSD shader container (TGM4).
+    Descriptor: control offset at +0, code offset at +8.
+    Control sections are 0x880 bytes; code length is at control +0x704.
+    """
+    if d[:4] != b'NXSD':
+        return []
+
+    if len(d) < 0x40:
+        red(f'{label}: truncated NXSD header')
+
+    version, file_size, code_start32, _, count, ctl_bytes, code_bytes = \
+        field(d, '<7I', 4, f'{label} NXSD header')
+
+    table, ctl_start, code_start = \
+        field(d, '<3Q', 0x28, f'{label} NXSD offsets')
+
+    if version != 0x100:
+        red(f'{label}: unsupported NXSD version {version:#x}')
+
+    if file_size != len(d):
+        red(f'{label}: NXSD file size mismatch')
+
+    if code_start32 != code_start:
+        red(f'{label}: inconsistent NXSD code offsets')
+
+    if not count or ctl_bytes % count:
+        red(f'{label}: invalid NXSD control section count')
+
+    stride = ctl_bytes // count
+
+    if stride != 0x880:
+        red(f'{label}: unsupported NXSD control stride {stride:#x}')
+
+    if table + count * 0x18 != ctl_start:
+        red(f'{label}: invalid NXSD descriptor table')
+
+    if ctl_start + ctl_bytes != code_start:
+        red(f'{label}: invalid NXSD control region')
+
+    if code_start + code_bytes != len(d):
+        red(f'{label}: invalid NXSD code region')
+
+    out = []
+    controls = []
+    code_ranges = []
+
+    for i in range(count):
+        pos = table + i * 0x18
+
+        values = field(d, '<6I', pos, f'{label} NXSD descriptor {i}')
+
+        ctl_rel = values[0]
+        code_rel = values[2]
+
+        if ctl_rel % stride or ctl_rel + stride > ctl_bytes:
+            red(f'{label}: invalid control offset in descriptor {i}')
+
+        ctl_at = ctl_start + ctl_rel
+        ctl = span(d, ctl_at, stride, f'{label} NXSD control {i}')
+
+        ncode = field(
+            d, '<I', ctl_at + 0x704,
+            f'{label} NXSD control {i}'
+        )[0]
+
+        code = span(
+            d, code_start + code_rel, ncode,
+            f'{label} NXSD code {i}'
+        )
+
+        if code[:4] == CS_MAGIC:
+            st = 'cs'
+        elif code[:4] == GFX_MAGIC:
+            st = sph_stage(code)
+        else:
+            st = None
+
+        if not st:
+            red(f'{label}: unknown shader stage in NXSD entry {i}')
+
+        why = check(label, st, ctl, code)
+
+        if why:
+            red(f'{label}: NXSD shader {i}: {why}')
+
+        controls.append(ctl_rel)
+        code_ranges.append((code_rel, code_rel + ncode))
+
+        out.append((
+            f'{label}#NXSD@{i}',
+            st,
+            ctl,
+            code
+        ))
+
+    if sorted(controls) != list(range(0, ctl_bytes, stride)):
+        red(f'{label}: NXSD control descriptors are incomplete')
+
+    cursor = 0
+
+    for start, end in sorted(code_ranges):
+        if start != cursor:
+            red(f'{label}: NXSD code sections overlap or have gaps')
+        cursor = end
+
+    if cursor != code_bytes:
+        red(f'{label}: NXSD code sections do not cover the code region')
+
+    return out
+
+
 def bahs_shaders(d, label):
     rsz, region = field(d, '<II', 0x18, f'{label} BAHS header')
     if region + rsz > len(d): red(f'{label} BAHS code region out of bounds')
@@ -2284,7 +2396,7 @@ def pixel_input_cover(shaders):
         k = min(ins, key=lambda k: (-len(ins[k] & left), k)); cover.append(k); left -= ins[k]
     return cover
 
-SINGLE_STAGE = ('#GLSLC@', '#UE', '#MTSPK@', '#MGFX@', '#NLG', '#PGSO', '#RAW@', '#TFXO@', '#NEEDLE@', '#SNOWDROP@', '#PHYRE@', '#SUMO@', '#NVNSH@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records, MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
+SINGLE_STAGE = ('#GLSLC@', '#UE', '#MTSPK@', '#MGFX@', '#NLG', '#PGSO', '#RAW@', '#TFXO@', '#NEEDLE@', '#SNOWDROP@', '#PHYRE@', '#SUMO@', '#NVNSH@', '#NXSD@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records, MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
 # Unreal Engine 3's shader caches (ue3_shaders, '#UE3@'); MonoGame's effects, whose passes may name no vertex shader and keep the one bound (Celeste: 10 of its 13 effects draw through SpriteBatch's vertex shader, which is in main); Next Level Games'
 # archives (Luigi's Mansion 3 makes 5,317 programs of one stage each at boot); PlatinumGames' shader objects (Bayonetta 3: one stage each, pg_shader); control sections loose in main
 # (Advance Wars 1+2: Re-Boot Camp's Bink shaders, raw_shaders), which no file pairs; YEBIS's effect file (tfxo_shaders); and Sumo's Ninty_NX descriptors and NVNsh records, one stage
@@ -2384,6 +2496,9 @@ def scan_file_in(args):
     if ext in ('.data', '.patch', '.debug', '.nxpc') and os.path.exists(stem + '.dict'): return rel, {}, set(), {}   # read through its Next Level Games index (nlg_shaders)
     with open(path, 'rb') as f: head = f.read(16)
     found = []; trees = {}
+    if head[:4] == b'NXSD':
+        found += nxsd_shaders(open(path, 'rb').read(), '/' + rel)
+        return rel, uniq_keys(found), var_pairs(found), trees
     if len(args) > 2 and args[2][0] == b'ARH1':
         arh_shaders(path, rel, args[2][1], found)
         return rel, uniq_keys(found), var_pairs(found), trees
